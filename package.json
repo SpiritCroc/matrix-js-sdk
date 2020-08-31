@@ -54,7 +54,7 @@
     "loglevel": "^1.6.4",
     "qs": "^6.5.2",
     "request": "^2.88.0",
-    "unhomoglyph": "^1.0.2"
+    "unhomoglyph": "^1.0.6"
   },
   "devDependencies": {
     "@babel/cli": "^7.7.5",
