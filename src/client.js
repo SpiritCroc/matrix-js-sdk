@@ -182,6 +182,11 @@ function keyFromRecoverySession(session, decryptionKey) {
  * Optional. Whether to allow a fallback ICE server should be used for negotiating a
  * WebRTC connection if the homeserver doesn't provide any servers. Defaults to false.
  *
+ * @param {boolean} [opts.usingExternalCrypto]
+ * Optional. Whether to allow sending messages to encrypted rooms when encryption
+ * is not available internally within this SDK. This is useful if you are using an external
+ * E2E proxy, for example. Defaults to false.
+ *
  * @param {object} opts.cryptoCallbacks Optional. Callbacks for crypto and cross-signing.
  *     The cross-signing API is currently UNSTABLE and may change without notice.
  *
@@ -248,12 +253,12 @@ function keyFromRecoverySession(session, decryptionKey) {
  * device.
  * Args:
  *   {string} name The name of the secret being requested.
- *   {string} user_id (string) The user ID of the client requesting
- *   {string} device_id The device ID of the client requesting the secret.
- *   {string} request_id The ID of the request. Used to match a
+ *   {string} userId The user ID of the client requesting
+ *   {string} deviceId The device ID of the client requesting the secret.
+ *   {string} requestId The ID of the request. Used to match a
  *     corresponding `crypto.secrets.request_cancelled`. The request ID will be
  *     unique per sender, device pair.
- *   {DeviceTrustLevel} device_trust: The trust status of the device requesting
+ *   {DeviceTrustLevel} deviceTrust: The trust status of the device requesting
  *     the secret as returned by {@link module:client~MatrixClient#checkDeviceTrust}.
  */
 export function MatrixClient(opts) {
@@ -265,6 +270,8 @@ export function MatrixClient(opts) {
     this.olmVersion = null; // Populated after initCrypto is done
 
     this.reEmitter = new ReEmitter(this);
+
+    this.usingExternalCrypto = opts.usingExternalCrypto;
 
     this.store = opts.store || new StubStore();
 
@@ -359,9 +366,9 @@ export function MatrixClient(opts) {
     // The pushprocessor caches useful things, so keep one and re-use it
     this._pushProcessor = new PushProcessor(this);
 
-    // Cache of the server's /versions response
+    // Promise to a response of the server's /versions response
     // TODO: This should expire: https://github.com/matrix-org/matrix-js-sdk/issues/1020
-    this._serverVersionsCache = null;
+    this._serverVersionsPromise = null;
 
     this._cachedCapabilities = null; // { capabilities: {}, lastUpdated: timestamp }
 
@@ -2749,6 +2756,13 @@ function _encryptEventIfNeeded(client, event, room) {
         return null;
     }
 
+    if (!client._crypto && client.usingExternalCrypto) {
+        // The client has opted to allow sending messages to encrypted
+        // rooms even if the room is encrypted, and we haven't setup
+        // crypto. This is useful for users of matrix-org/pantalaimon
+        return null;
+    }
+
     if (event.getType() === "m.reaction") {
         // For reactions, there is a very little gained by encrypting the entire
         // event, as relation data is already kept in the clear. Event
@@ -4981,19 +4995,22 @@ MatrixClient.prototype.stopClient = function() {
  * unstable APIs it supports
  * @return {Promise<object>} The server /versions response
  */
-MatrixClient.prototype.getVersions = async function() {
-    if (this._serverVersionsCache === null) {
-        this._serverVersionsCache = await this._http.request(
-            undefined, // callback
-            "GET", "/_matrix/client/versions",
-            undefined, // queryParams
-            undefined, // data
-            {
-                prefix: '',
-            },
-        );
+MatrixClient.prototype.getVersions = function() {
+    if (this._serverVersionsPromise) {
+        return this._serverVersionsPromise;
     }
-    return this._serverVersionsCache;
+
+    this._serverVersionsPromise = this._http.request(
+        undefined, // callback
+        "GET", "/_matrix/client/versions",
+        undefined, // queryParams
+        undefined, // data
+        {
+            prefix: '',
+        },
+    );
+
+    return this._serverVersionsPromise;
 };
 
 /**
@@ -5090,6 +5107,20 @@ MatrixClient.prototype.doesServerSupportUnstableFeature = async function(feature
     if (!response) return false;
     const unstableFeatures = response["unstable_features"];
     return unstableFeatures && !!unstableFeatures[feature];
+};
+
+/**
+ * Query the server to see if it is forcing encryption to be enabled for
+ * a given room preset, based on the /versions response.
+ * @param {string} presetName The name of the preset to check.
+ * @returns {Promise<boolean>} true if the server is forcing encryption
+ * for the preset.
+ */
+MatrixClient.prototype.doesServerForceEncryptionForPreset = async function(presetName) {
+    const response = await this.getVersions();
+    if (!response) return false;
+    const unstableFeatures = response["unstable_features"];
+    return unstableFeatures && !!unstableFeatures[`io.element.e2ee_forced.${presetName}`];
 };
 
 /**
@@ -5200,7 +5231,11 @@ function setupCallEventHandler(client) {
                     // This call has previously been answered or hung up: ignore it
                     return;
                 }
-                callEventHandler(e);
+                try {
+                    callEventHandler(e);
+                } catch (e) {
+                    logger.error("Caught exception handling call event", e);
+                }
             });
             callEventBuffer = [];
         }
@@ -5226,7 +5261,11 @@ function setupCallEventHandler(client) {
                 } else {
                     // This one wasn't buffered so just run the event handler for it
                     // straight away
-                    callEventHandler(event);
+                    try {
+                        callEventHandler(event);
+                    } catch (e) {
+                        logger.error("Caught exception handling call event", e);
+                    }
                 }
             });
         }
