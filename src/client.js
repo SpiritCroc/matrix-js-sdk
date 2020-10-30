@@ -33,6 +33,7 @@ import {EventTimeline} from "./models/event-timeline";
 import {SearchResult} from "./models/search-result";
 import {StubStore} from "./store/stub";
 import {createNewMatrixCall} from "./webrtc/call";
+import {CallEventHandler} from './webrtc/callEventHandler';
 import * as utils from './utils';
 import {sleep} from './utils';
 import {
@@ -55,6 +56,7 @@ import {PushProcessor} from "./pushprocessor";
 import {encodeBase64, decodeBase64} from "./crypto/olmlib";
 import { User } from "./models/user";
 import {AutoDiscovery} from "./autodiscovery";
+import {DEHYDRATION_ALGORITHM} from "./crypto/dehydration";
 
 const SCROLLBACK_DELAY_MS = 3000;
 export const CRYPTO_ENABLED = isCryptoAvailable();
@@ -234,7 +236,14 @@ function keyFromRecoverySession(session, decryptionKey) {
  *       {
  *           keys: {
  *               <key name>: {
- *                   pubkey: {UInt8Array}
+ *                   "algorithm": "m.secret_storage.v1.aes-hmac-sha2",
+ *                   "passphrase": {
+ *                       "algorithm": "m.pbkdf2",
+ *                       "iterations": 500000,
+ *                       "salt": "..."
+ *                   },
+ *                   "iv": "...",
+ *                   "mac": "..."
  *               }, ...
  *           }
  *       }
@@ -246,6 +255,7 @@ function keyFromRecoverySession(session, decryptionKey) {
  * desired to avoid user prompts.
  * Args:
  *   {string} keyId the ID of the new key
+ *   {object} keyInfo Infomation about the key as above for `getSecretStorageKey`
  *   {Uint8Array} key the new private key
  *
  * @param {function} [opts.cryptoCallbacks.onSecretRequested]
@@ -327,17 +337,15 @@ export function MatrixClient(opts) {
     }
     this.clientRunning = false;
 
-    this.callList = {
-        // callId: MatrixCall
-    };
-
     // try constructing a MatrixCall to see if we are running in an environment
     // which has WebRTC. If we are, listen for and handle m.call.* events.
     const call = createNewMatrixCall(this);
     this._supportsVoip = false;
     if (call) {
-        setupCallEventHandler(this);
+        this._callEventHandler = new CallEventHandler(this);
         this._supportsVoip = true;
+    } else {
+        this._callEventHandler = null;
     }
     this._syncingRetry = null;
     this._syncApi = null;
@@ -458,6 +466,121 @@ export function MatrixClient(opts) {
 }
 utils.inherits(MatrixClient, EventEmitter);
 utils.extend(MatrixClient.prototype, MatrixBaseApis.prototype);
+
+/**
+ * Try to rehydrate a device if available.  The client must have been
+ * initialized with a `cryptoCallback.getDehydrationKey` option, and this
+ * function must be called before initCrypto and startClient are called.
+ *
+ * @return {Promise} Resolves to undefined if a device could not be dehydrated, or
+ *     to the new device ID if the dehydration was successful.
+ * @return {module:http-api.MatrixError} Rejects: with an error response.
+ */
+MatrixClient.prototype.rehydrateDevice = async function() {
+    if (this._crypto) {
+        throw new Error("Cannot rehydrate device after crypto is initialized");
+    }
+
+    if (!this._cryptoCallbacks.getDehydrationKey) {
+        return;
+    }
+
+    let getDeviceResult;
+    try {
+        getDeviceResult = await this._http.authedRequest(
+            undefined,
+            "GET",
+            "/dehydrated_device",
+            undefined, undefined,
+            {
+                prefix: "/_matrix/client/unstable/org.matrix.msc2697.v2",
+            },
+        );
+    } catch (e) {
+        logger.info("could not get dehydrated device", e.toString());
+        return;
+    }
+
+    if (!getDeviceResult.device_data || !getDeviceResult.device_id) {
+        logger.info("no dehydrated device found");
+        return;
+    }
+
+    const account = new global.Olm.Account();
+    try {
+        const deviceData = getDeviceResult.device_data;
+        if (deviceData.algorithm !== DEHYDRATION_ALGORITHM) {
+            logger.warn("Wrong algorithm for dehydrated device");
+            return;
+        }
+        logger.log("unpickling dehydrated device");
+        const key = await this._cryptoCallbacks.getDehydrationKey(
+            deviceData,
+            (k) => {
+                // copy the key so that it doesn't get clobbered
+                account.unpickle(new Uint8Array(k), deviceData.account);
+            },
+        );
+        account.unpickle(key, deviceData.account);
+        logger.log("unpickled device");
+
+        const rehydrateResult = await this._http.authedRequest(
+            undefined,
+            "POST",
+            "/dehydrated_device/claim",
+            undefined,
+            {
+                device_id: getDeviceResult.device_id,
+            },
+            {
+                prefix: "/_matrix/client/unstable/org.matrix.msc2697.v2",
+            },
+        );
+
+        if (rehydrateResult.success === true) {
+            this.deviceId = getDeviceResult.device_id;
+            logger.info("using dehydrated device");
+            const pickleKey = this.pickleKey || "DEFAULT_KEY";
+            this._exportedOlmDeviceToImport = {
+                pickledAccount: account.pickle(pickleKey),
+                sessions: [],
+                pickleKey: pickleKey,
+            };
+            account.free();
+            return this.deviceId;
+        } else {
+            account.free();
+            logger.info("not using dehydrated device");
+            return;
+        }
+    } catch (e) {
+        account.free();
+        logger.warn("could not unpickle", e);
+    }
+};
+
+/**
+ * Set the dehydration key.  This will also periodically dehydrate devices to
+ * the server.
+ *
+ * @param {Uint8Array} key the dehydration key
+ * @param {object} [keyInfo] Information about the key.  Primarily for
+ *     information about how to generate the key from a passphrase.
+ * @param {string} [deviceDisplayName] The device display name for the
+ *     dehydrated device.
+ * @return {Promise} A promise that resolves when the dehydrated device is stored.
+ */
+MatrixClient.prototype.setDehydrationKey = async function(
+    key, keyInfo = {}, deviceDisplayName = undefined,
+) {
+    if (!(this._crypto)) {
+        logger.warn('not dehydrating device if crypto is not enabled');
+        return;
+    }
+    return await this._crypto._dehydrationManager.setDehydrationKey(
+        key, keyInfo, deviceDisplayName,
+    );
+};
 
 MatrixClient.prototype.exportDevice = async function() {
     if (!(this._crypto)) {
@@ -1318,7 +1441,7 @@ wrapCryptoFuncs(MatrixClient, [
  *     containing the key, or rejects if the key cannot be obtained.
  * Returns:
  *     {Promise} A promise which resolves to key creation data for
- *     SecretStorage#addKey: an object with `passphrase` and/or `pubkey` fields.
+ *     SecretStorage#addKey: an object with `passphrase` etc fields.
  */
 
 /**
@@ -1333,7 +1456,9 @@ wrapCryptoFuncs(MatrixClient, [
  * @param {string} [keyName] the name of the key.  If not given, a random
  *     name will be generated.
  *
- * @return {string} the name of the key
+ * @return {object} An object with:
+ *     keyId: {string} the ID of the key
+ *     keyInfo: {object} details about the key (iv, mac, passphrase)
  */
 
 /**
@@ -1893,7 +2018,7 @@ MatrixClient.prototype.isValidRecoveryKey = function(recoveryKey) {
  *
  * @param {string} password Passphrase
  * @param {object} backupInfo Backup metadata from `checkKeyBackup`
- * @return {Promise<Buffer>} key backup key
+ * @return {Promise<Uint8Array>} key backup key
  */
 MatrixClient.prototype.keyBackupKeyFromPassword = function(
     password, backupInfo,
@@ -1908,7 +2033,7 @@ MatrixClient.prototype.keyBackupKeyFromPassword = function(
  * The cross-signing API is currently UNSTABLE and may change without notice.
  *
  * @param {string} recoveryKey The recovery key
- * @return {Buffer} key backup key
+ * @return {Uint8Array} key backup key
  */
 MatrixClient.prototype.keyBackupKeyFromRecoveryKey = function(recoveryKey) {
     return decodeRecoveryKey(recoveryKey);
@@ -2054,7 +2179,7 @@ MatrixClient.prototype._restoreKeyBackup = function(
     // This is async.
     this._crypto.storeSessionBackupPrivateKey(privKey)
     .catch((e) => {
-        console.warn("Error caching session backup key:", e);
+        logger.warn("Error caching session backup key:", e);
     }).then(cacheCompleteCallback);
 
     if (progressCallback) {
@@ -2858,14 +2983,19 @@ function _sendEventHttpRequest(client, event) {
  * @param {string} eventId
  * @param {string} [txnId]  transaction id. One will be made up if not
  *    supplied.
- * @param {module:client.callback} callback Optional.
+ * @param {object|module:client.callback} callbackOrOpts
+ *    Options to pass on, may contain `reason`.
+ *    Can be callback for backwards compatibility.
  * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
-MatrixClient.prototype.redactEvent = function(roomId, eventId, txnId, callback) {
+MatrixClient.prototype.redactEvent = function(roomId, eventId, txnId, callbackOrOpts) {
+    const opts = typeof(callbackOrOpts) === 'object' ? callbackOrOpts : {};
+    const reason = opts.reason;
+    const callback = typeof(callbackOrOpts) === 'function' ? callbackOrOpts : undefined;
     return this._sendCompleteEvent(roomId, {
         type: "m.room.redaction",
-        content: {},
+        content: { reason: reason },
         redacts: eventId,
     }, txnId, callback);
 };
@@ -4984,6 +5114,11 @@ MatrixClient.prototype.stopClient = function() {
     if (this._peekSync) {
         this._peekSync.stopPeeking();
     }
+    if (this._callEventHandler) {
+        this._callEventHandler.stop();
+        this._callEventHandler = null;
+    }
+
     global.clearTimeout(this._checkTurnServersTimeoutID);
     if (this._clientWellKnownIntervalID !== undefined) {
         global.clearInterval(this._clientWellKnownIntervalID);
@@ -5008,7 +5143,12 @@ MatrixClient.prototype.getVersions = function() {
         {
             prefix: '',
         },
-    );
+    ).catch((e) => {
+        // Need to unset this if it fails, otherwise we'll never retry
+        this._serverVersionsPromise = null;
+        // but rethrow the exception to anything that was waiting
+        throw e;
+    });
 
     return this._serverVersionsPromise;
 };
@@ -5193,227 +5333,6 @@ async function(roomId, eventId, relationType, eventType, opts = {}) {
     };
 };
 
-function setupCallEventHandler(client) {
-    const candidatesByCall = {
-        // callId: [Candidate]
-    };
-
-    // The sync code always emits one event at a time, so it will patiently
-    // wait for us to finish processing a call invite before delivering the
-    // next event, even if that next event is a hangup. We therefore accumulate
-    // all our call events and then process them on the 'sync' event, ie.
-    // each time a sync has completed. This way, we can avoid emitting incoming
-    // call events if we get both the invite and answer/hangup in the same sync.
-    // This happens quite often, eg. replaying sync from storage, catchup sync
-    // after loading and after we've been offline for a bit.
-    let callEventBuffer = [];
-    function evaluateEventBuffer() {
-        if (client.getSyncState() === "SYNCING") {
-            // don't process any events until they are all decrypted
-            if (callEventBuffer.some((e) => e.isBeingDecrypted())) return;
-
-            const ignoreCallIds = {}; // Set<String>
-            // inspect the buffer and mark all calls which have been answered
-            // or hung up before passing them to the call event handler.
-            for (let i = callEventBuffer.length - 1; i >= 0; i--) {
-                const ev = callEventBuffer[i];
-                if (ev.getType() === "m.call.answer" ||
-                        ev.getType() === "m.call.hangup") {
-                    ignoreCallIds[ev.getContent().call_id] = "yep";
-                }
-            }
-            // now loop through the buffer chronologically and inject them
-            callEventBuffer.forEach(function(e) {
-                if (
-                    e.getType() === "m.call.invite" &&
-                    ignoreCallIds[e.getContent().call_id]
-                ) {
-                    // This call has previously been answered or hung up: ignore it
-                    return;
-                }
-                try {
-                    callEventHandler(e);
-                } catch (e) {
-                    logger.error("Caught exception handling call event", e);
-                }
-            });
-            callEventBuffer = [];
-        }
-    }
-    client.on("sync", evaluateEventBuffer);
-
-    function onEvent(event) {
-        // any call events or ones that might be once they're decrypted
-        if (event.getType().indexOf("m.call.") === 0 || event.isBeingDecrypted()) {
-            // queue up for processing once all events from this sync have been
-            // processed (see above).
-            callEventBuffer.push(event);
-        }
-
-        if (event.isBeingDecrypted() || event.isDecryptionFailure()) {
-            // add an event listener for once the event is decrypted.
-            event.once("Event.decrypted", () => {
-                if (event.getType().indexOf("m.call.") === -1) return;
-
-                if (callEventBuffer.includes(event)) {
-                    // we were waiting for that event to decrypt, so recheck the buffer
-                    evaluateEventBuffer();
-                } else {
-                    // This one wasn't buffered so just run the event handler for it
-                    // straight away
-                    try {
-                        callEventHandler(event);
-                    } catch (e) {
-                        logger.error("Caught exception handling call event", e);
-                    }
-                }
-            });
-        }
-    }
-    client.on("event", onEvent);
-
-    function callEventHandler(event) {
-        const content = event.getContent();
-        let call = content.call_id ? client.callList[content.call_id] : undefined;
-        let i;
-        //console.info("RECV %s content=%s", event.getType(), JSON.stringify(content));
-
-        if (event.getType() === "m.call.invite") {
-            if (event.getSender() === client.credentials.userId) {
-                return; // ignore invites you send
-            }
-
-            if (event.getAge() > content.lifetime) {
-                return; // expired call
-            }
-
-            if (call && call.state === "ended") {
-                return; // stale/old invite event
-            }
-            if (call) {
-                logger.log(
-                    "WARN: Already have a MatrixCall with id %s but got an " +
-                    "invite. Clobbering.",
-                    content.call_id,
-                );
-            }
-
-            call = createNewMatrixCall(client, event.getRoomId(), {
-                forceTURN: client._forceTURN,
-            });
-            if (!call) {
-                logger.log(
-                    "Incoming call ID " + content.call_id + " but this client " +
-                    "doesn't support WebRTC",
-                );
-                // don't hang up the call: there could be other clients
-                // connected that do support WebRTC and declining the
-                // the call on their behalf would be really annoying.
-                return;
-            }
-
-            call.callId = content.call_id;
-            call._initWithInvite(event);
-            client.callList[call.callId] = call;
-
-            // if we stashed candidate events for that call ID, play them back now
-            if (candidatesByCall[call.callId]) {
-                for (i = 0; i < candidatesByCall[call.callId].length; i++) {
-                    call._gotRemoteIceCandidate(
-                        candidatesByCall[call.callId][i],
-                    );
-                }
-            }
-
-            // Were we trying to call that user (room)?
-            let existingCall;
-            const existingCalls = utils.values(client.callList);
-            for (i = 0; i < existingCalls.length; ++i) {
-                const thisCall = existingCalls[i];
-                if (call.roomId === thisCall.roomId &&
-                        thisCall.direction === 'outbound' &&
-                        (["wait_local_media", "create_offer", "invite_sent"].indexOf(
-                            thisCall.state) !== -1)) {
-                    existingCall = thisCall;
-                    break;
-                }
-            }
-
-            if (existingCall) {
-                // If we've only got to wait_local_media or create_offer and
-                // we've got an invite, pick the incoming call because we know
-                // we haven't sent our invite yet otherwise, pick whichever
-                // call has the lowest call ID (by string comparison)
-                if (existingCall.state === 'wait_local_media' ||
-                        existingCall.state === 'create_offer' ||
-                        existingCall.callId > call.callId) {
-                    logger.log(
-                        "Glare detected: answering incoming call " + call.callId +
-                        " and canceling outgoing call " + existingCall.callId,
-                    );
-                    existingCall._replacedBy(call);
-                    call.answer();
-                } else {
-                    logger.log(
-                        "Glare detected: rejecting incoming call " + call.callId +
-                        " and keeping outgoing call " + existingCall.callId,
-                    );
-                    call.hangup();
-                }
-            } else {
-                client.emit("Call.incoming", call);
-            }
-        } else if (event.getType() === 'm.call.answer') {
-            if (!call) {
-                return;
-            }
-            if (event.getSender() === client.credentials.userId) {
-                if (call.state === 'ringing') {
-                    call._onAnsweredElsewhere(content);
-                }
-            } else {
-                call._receivedAnswer(content);
-            }
-        } else if (event.getType() === 'm.call.candidates') {
-            if (event.getSender() === client.credentials.userId) {
-                return;
-            }
-            if (!call) {
-                // store the candidates; we may get a call eventually.
-                if (!candidatesByCall[content.call_id]) {
-                    candidatesByCall[content.call_id] = [];
-                }
-                candidatesByCall[content.call_id] = candidatesByCall[
-                    content.call_id
-                ].concat(content.candidates);
-            } else {
-                for (i = 0; i < content.candidates.length; i++) {
-                    call._gotRemoteIceCandidate(content.candidates[i]);
-                }
-            }
-        } else if (event.getType() === 'm.call.hangup') {
-            // Note that we also observe our own hangups here so we can see
-            // if we've already rejected a call that would otherwise be valid
-            if (!call) {
-                // if not live, store the fact that the call has ended because
-                // we're probably getting events backwards so
-                // the hangup will come before the invite
-                call = createNewMatrixCall(client, event.getRoomId());
-                if (call) {
-                    call.callId = content.call_id;
-                    call._initWithHangup(event);
-                    client.callList[content.call_id] = call;
-                }
-            } else {
-                if (call.state !== 'ended') {
-                    call._onHangupReceived(content);
-                    delete client.callList[content.call_id];
-                }
-            }
-        }
-    }
-}
-
 function checkTurnServers(client) {
     if (!client._supportsVoip) {
         return;
@@ -5470,9 +5389,8 @@ function _PojoToMatrixEventMapper(client, options) {
             }
             event.attemptDecryption(client._crypto);
         }
-        const room = client.getRoom(event.getRoomId());
-        if (room && !preventReEmit) {
-            room.reEmitter.reEmit(event, ["Event.replaced"]);
+        if (!preventReEmit) {
+            client.reEmitter.reEmit(event, ["Event.replaced"]);
         }
         return event;
     }

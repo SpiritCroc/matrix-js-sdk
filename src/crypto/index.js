@@ -56,6 +56,7 @@ import {ToDeviceChannel, ToDeviceRequests} from "./verification/request/ToDevice
 import {IllegalMethod} from "./verification/IllegalMethod";
 import {KeySignatureUploadError} from "../errors";
 import {decryptAES, encryptAES} from './aes';
+import {DehydrationManager} from './dehydration';
 
 const DeviceVerification = DeviceInfo.DeviceVerification;
 
@@ -146,7 +147,7 @@ export function Crypto(baseApis, sessionStore, userId, deviceId,
                     method,
                 );
             } else {
-                console.warn(`Excluding unknown verification method ${method}`);
+                logger.warn(`Excluding unknown verification method ${method}`);
             }
         }
     } else {
@@ -242,6 +243,8 @@ export function Crypto(baseApis, sessionStore, userId, deviceId,
     this._secretStorage = new SecretStorage(
         baseApis, cryptoCallbacks,
     );
+
+    this._dehydrationManager = new DehydrationManager(this);
 
     // Assuming no app-supplied callback, default to getting from SSSS.
     if (!cryptoCallbacks.getCrossSigningKey && cryptoCallbacks.getSecretStorageKey) {
@@ -630,7 +633,7 @@ Crypto.prototype.bootstrapCrossSigning = async function({
  *     containing the key, or rejects if the key cannot be obtained.
  * Returns:
  *     {Promise} A promise which resolves to key creation data for
- *     SecretStorage#addKey: an object with `passphrase` and/or `pubkey` fields.
+ *     SecretStorage#addKey: an object with `passphrase` etc fields.
  */
 Crypto.prototype.bootstrapSecretStorage = async function({
     createSecretStorageKey = async () => ({ }),
@@ -660,13 +663,13 @@ Crypto.prototype.bootstrapSecretStorage = async function({
             opts.key = privateKey;
         }
 
-        const keyId = await secretStorage.addKey(
+        const { keyId, keyInfo } = await secretStorage.addKey(
             SECRET_STORAGE_ALGORITHM_V1_AES, opts,
         );
 
         if (privateKey) {
             // make the private key available to encrypt 4S secrets
-            builder.ssssCryptoCallbacks.addPrivateKey(keyId, privateKey);
+            builder.ssssCryptoCallbacks.addPrivateKey(keyId, keyInfo, privateKey);
         }
 
         await secretStorage.setDefaultKeyId(keyId);
@@ -679,9 +682,9 @@ Crypto.prototype.bootstrapSecretStorage = async function({
                 {keys: {[keyId]: keyInfo}}, "",
             );
             if (key) {
-                const keyData = key[1];
-                builder.ssssCryptoCallbacks.addPrivateKey(keyId, keyData);
-                const {iv, mac} = await SecretStorage._calculateKeyCheck(keyData);
+                const privateKey = key[1];
+                builder.ssssCryptoCallbacks.addPrivateKey(keyId, keyInfo, privateKey);
+                const {iv, mac} = await SecretStorage._calculateKeyCheck(privateKey);
                 keyInfo.iv = iv;
                 keyInfo.mac = mac;
 
@@ -689,6 +692,26 @@ Crypto.prototype.bootstrapSecretStorage = async function({
                     `m.secret_storage.key.${keyId}`, keyInfo,
                 );
             }
+        }
+    };
+
+    const signKeyBackupWithCrossSigning = async (keyBackupAuthData) => {
+        if (
+            this._crossSigningInfo.getId() &&
+            await this._crossSigningInfo.isStoredInKeyCache("master")
+        ) {
+            try {
+                logger.log("Adding cross-signing signature to key backup");
+                await this._crossSigningInfo.signObject(keyBackupAuthData, "master");
+            } catch (e) {
+                // This step is not critical (just helpful), so we catch here
+                // and continue if it fails.
+                logger.error("Signing key backup with cross-signing keys failed", e);
+            }
+        } else {
+            logger.warn(
+                "Cross-signing keys not available, skipping signature on key backup",
+            );
         }
     };
 
@@ -758,19 +781,7 @@ Crypto.prototype.bootstrapSecretStorage = async function({
         // The backup is trusted because the user provided the private key.
         // Sign the backup with the cross-signing key so the key backup can
         // be trusted via cross-signing.
-        if (
-            this._crossSigningInfo.getId() &&
-            this._crossSigningInfo.isStoredInKeyCache("master")
-        ) {
-            logger.log("Adding cross-signing signature to key backup");
-            await this._crossSigningInfo.signObject(
-                keyBackupInfo.auth_data, "master",
-            );
-        } else {
-            logger.warn(
-                "Cross-signing keys not available, skipping signature on key backup",
-            );
-        }
+        await signKeyBackupWithCrossSigning(keyBackupInfo.auth_data);
 
         builder.addSessionBackup(keyBackupInfo);
     } else {
@@ -821,18 +832,8 @@ Crypto.prototype.bootstrapSecretStorage = async function({
             auth_data: info.auth_data,
         };
 
-        if (
-            this._crossSigningInfo.getId() &&
-            this._crossSigningInfo.isStoredInKeyCache("master")
-        ) {
-            // sign with cross-sign master key
-            logger.log("Adding cross-signing signature to key backup");
-            await this._crossSigningInfo.signObject(data.auth_data, "master");
-        } else {
-            logger.warn(
-                "Cross-signing keys not available, skipping signature on key backup",
-            );
-        }
+        // Sign with cross-signing master key
+        await signKeyBackupWithCrossSigning(data.auth_data);
 
         // sign with the device fingerprint
         await this._signObject(data.auth_data);
@@ -1856,6 +1857,14 @@ Crypto.prototype.updateOneTimeKeyCount = function(currentCount) {
     }
 };
 
+Crypto.prototype.setNeedsNewFallback = function(needsNewFallback) {
+    this._needsNewFallback = !!needsNewFallback;
+};
+
+Crypto.prototype.getNeedsNewFallback = function() {
+    return this._needsNewFallback;
+};
+
 // check if it's time to upload one-time keys, and do so if so.
 function _maybeUploadOneTimeKeys(crypto) {
     // frequency with which to check & upload one-time keys
@@ -1903,27 +1912,31 @@ function _maybeUploadOneTimeKeys(crypto) {
     // out stale private keys that won't receive a message.
     const keyLimit = Math.floor(maxOneTimeKeys / 2);
 
-    function uploadLoop(keyCount) {
-        if (keyLimit <= keyCount) {
-            // If we don't need to generate any more keys then we are done.
-            return Promise.resolve();
-        }
+    async function uploadLoop(keyCount) {
+        while (keyLimit > keyCount || crypto.getNeedsNewFallback()) {
+            // Ask olm to generate new one time keys, then upload them to synapse.
+            if (keyLimit > keyCount) {
+                logger.info("generating oneTimeKeys");
+                const keysThisLoop = Math.min(keyLimit - keyCount, maxKeysPerCycle);
+                await crypto._olmDevice.generateOneTimeKeys(keysThisLoop);
+            }
 
-        const keysThisLoop = Math.min(keyLimit - keyCount, maxKeysPerCycle);
+            if (crypto.getNeedsNewFallback()) {
+                logger.info("generating fallback key");
+                await crypto._olmDevice.generateFallbackKey();
+            }
 
-        // Ask olm to generate new one time keys, then upload them to synapse.
-        return crypto._olmDevice.generateOneTimeKeys(keysThisLoop).then(() => {
-            return _uploadOneTimeKeys(crypto);
-        }).then((res) => {
+            logger.info("calling _uploadOneTimeKeys");
+            const res = await _uploadOneTimeKeys(crypto);
             if (res.one_time_key_counts && res.one_time_key_counts.signed_curve25519) {
                 // if the response contains a more up to date value use this
                 // for the next loop
-                return uploadLoop(res.one_time_key_counts.signed_curve25519);
+                keyCount = res.one_time_key_counts.signed_curve25519;
             } else {
-                throw new Error("response for uploading keys does not contain "
-                              + "one_time_key_counts.signed_curve25519");
+                throw new Error("response for uploading keys does not contain " +
+                                "one_time_key_counts.signed_curve25519");
             }
-        });
+        }
     }
 
     crypto._oneTimeKeyCheckInProgress = true;
@@ -1955,10 +1968,21 @@ function _maybeUploadOneTimeKeys(crypto) {
 
 // returns a promise which resolves to the response
 async function _uploadOneTimeKeys(crypto) {
+    const promises = [];
+
+    const fallbackJson = {};
+    if (crypto.getNeedsNewFallback()) {
+        const fallbackKeys = await crypto._olmDevice.getFallbackKey();
+        for (const [keyId, key] of Object.entries(fallbackKeys.curve25519)) {
+            const k = { key, fallback: true };
+            fallbackJson["signed_curve25519:" + keyId] = k;
+            promises.push(crypto._signObject(k));
+        }
+        crypto.setNeedsNewFallback(false);
+    }
+
     const oneTimeKeys = await crypto._olmDevice.getOneTimeKeys();
     const oneTimeJson = {};
-
-    const promises = [];
 
     for (const keyId in oneTimeKeys.curve25519) {
         if (oneTimeKeys.curve25519.hasOwnProperty(keyId)) {
@@ -1973,7 +1997,8 @@ async function _uploadOneTimeKeys(crypto) {
     await Promise.all(promises);
 
     const res = await crypto._baseApis.uploadKeysRequest({
-        one_time_keys: oneTimeJson,
+        "one_time_keys": oneTimeJson,
+        "org.matrix.msc2732.fallback_keys": fallbackJson,
     });
 
     await crypto._olmDevice.markKeysAsPublished();
@@ -2400,7 +2425,7 @@ Crypto.prototype.getEventSenderDeviceInfo = function(event) {
     if (claimedKey !== device.getFingerprint()) {
         logger.warn(
             "Event " + event.getId() + " claims ed25519 key " + claimedKey +
-                "but sender device has key " + device.getFingerprint());
+                " but sender device has key " + device.getFingerprint());
         return null;
     }
 

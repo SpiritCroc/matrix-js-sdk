@@ -94,6 +94,14 @@ if [ $# -ne 1 ]; then
     exit 1
 fi
 
+# We use Git branch / commit dependencies for some packages, and Yarn seems
+# to have a hard time getting that right. See also
+# https://github.com/yarnpkg/yarn/issues/4734. As a workaround, we clean the
+# global cache here to ensure we get the right thing.
+yarn cache clean
+# Ensure all dependencies are updated
+yarn install --ignore-scripts
+
 if [ -z "$skip_changelog" ]; then
     # update_changelog doesn't have a --version flag
     update_changelog -h > /dev/null || (echo "github-changelog-generator is required: please install it"; exit)
@@ -204,11 +212,6 @@ if [ $dodist -eq 0 ]; then
     pushd "$builddir"
     git clone "$projdir" .
     git checkout "$rel_branch"
-    # We use Git branch / commit dependencies for some packages, and Yarn seems
-    # to have a hard time getting that right. See also
-    # https://github.com/yarnpkg/yarn/issues/4734. As a workaround, we clean the
-    # global cache here to ensure we get the right thing.
-    yarn cache clean
     yarn install
     # We haven't tagged yet, so tell the dist script what version
     # it's building
@@ -327,6 +330,7 @@ if [ -z "$skip_jsdoc" ]; then
         $release index.html
     git add "$release"
     git commit --no-verify -m "Add jsdoc for $release" index.html "$release"
+    git push origin gh-pages
 fi
 
 # if it is a pre-release, leave it on the release branch for now.
@@ -339,18 +343,15 @@ fi
 echo "updating master branch"
 git checkout master
 git pull
-git merge "$rel_branch"
+git merge "$rel_branch" --no-edit
 
-# push master and docs (if generated) to github
+# push master to github
 git push origin master
-if [ -z "$skip_jsdoc" ]; then
-    git push origin gh-pages
-fi
 
 # finally, merge master back onto develop (if it exists)
 if [ $(git branch -lr | grep origin/develop -c) -ge 1 ]; then
     git checkout develop
     git pull
-    git merge master
+    git merge master --no-edit
     git push origin develop
 fi

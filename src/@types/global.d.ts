@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import * as Olm from "olm";
+// this is needed to tell TS about global.Olm
+import * as Olm from "olm"; // eslint-disable-line @typescript-eslint/no-unused-vars
 
 export {};
 
@@ -22,10 +23,26 @@ declare global {
     namespace NodeJS {
         interface Global {
             localStorage: Storage;
-            Olm: Olm;
         }
     }
-    interface Global {
-        Olm: Olm;
+
+    interface MediaDevices {
+        // This is experimental and types don't know about it yet
+        // https://github.com/microsoft/TypeScript/issues/33232
+        getDisplayMedia(constraints: MediaStreamConstraints): Promise<MediaStream>;
+    }
+
+    interface HTMLAudioElement {
+        // sinkId & setSinkId are experimental and typescript doesn't know about them
+        sinkId: string;
+        setSinkId(outputId: string);
+    }
+
+    interface DummyInterfaceWeShouldntBeUsingThis {}
+
+    interface Navigator {
+        // We check for the webkit-prefixed getUserMedia to detect if we're
+        // on webkit: we should check if we still need to do this
+        webkitGetUserMedia: DummyInterfaceWeShouldntBeUsingThis;
     }
 }

@@ -26,6 +26,7 @@ import {MemoryCryptoStore} from '../../../src/crypto/store/memory-crypto-store';
 import 'fake-indexeddb/auto';
 import 'jest-localstorage-mock';
 import {OlmDevice} from "../../../src/crypto/OlmDevice";
+import {logger} from '../../../src/logger';
 
 const userId = "@alice:example.com";
 
@@ -51,7 +52,7 @@ const masterKeyPub = "nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk";
 
 describe("CrossSigningInfo.getCrossSigningKey", function() {
     if (!global.Olm) {
-        console.warn('Not running megolm backup unit tests: libolm not present');
+        logger.warn('Not running megolm backup unit tests: libolm not present');
         return;
     }
 
@@ -83,9 +84,16 @@ describe("CrossSigningInfo.getCrossSigningKey", function() {
         const info = new CrossSigningInfo(userId, {
             getCrossSigningKey: () => testKey,
         });
-        const [pubKey, ab] = await info.getCrossSigningKey("master", masterKeyPub);
+        const [pubKey, pkSigning] = await info.getCrossSigningKey("master", masterKeyPub);
         expect(pubKey).toEqual(masterKeyPub);
-        expect(ab).toEqual({a: 106712, b: 106712});
+        // check that the pkSigning object corresponds to the pubKey
+        const signature = pkSigning.sign("message");
+        const util = new global.Olm.Utility();
+        try {
+            util.ed25519_verify(pubKey, "message", signature);
+        } finally {
+            util.free();
+        }
     });
 
     it.each(types)("should request a key from the cache callback (if set)" +
