@@ -577,9 +577,31 @@ MatrixClient.prototype.setDehydrationKey = async function(
         logger.warn('not dehydrating device if crypto is not enabled');
         return;
     }
-    return await this._crypto._dehydrationManager.setDehydrationKey(
+    return await this._crypto._dehydrationManager.setKeyAndQueueDehydration(
         key, keyInfo, deviceDisplayName,
     );
+};
+
+/**
+ * Creates a new dehydrated device (without queuing periodic dehydration)
+ * @param {Uint8Array} key the dehydration key
+ * @param {object} [keyInfo] Information about the key.  Primarily for
+ *     information about how to generate the key from a passphrase.
+ * @param {string} [deviceDisplayName] The device display name for the
+ *     dehydrated device.
+ * @return {Promise<String>} the device id of the newly created dehydrated device
+ */
+MatrixClient.prototype.createDehydratedDevice = async function(
+    key, keyInfo = {}, deviceDisplayName = undefined,
+) {
+    if (!(this._crypto)) {
+        logger.warn('not dehydrating device if crypto is not enabled');
+        return;
+    }
+    await this._crypto._dehydrationManager.setKey(
+        key, keyInfo, deviceDisplayName,
+    );
+    return await this._crypto._dehydrationManager.dehydrateDevice();
 };
 
 MatrixClient.prototype.exportDevice = async function() {
@@ -3699,25 +3721,39 @@ MatrixClient.prototype.setProfileInfo = function(info, data, callback) {
 /**
  * @param {string} name
  * @param {module:client.callback} callback Optional.
- * @return {Promise} Resolves: TODO
+ * @return {Promise} Resolves: {} an empty object.
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
-MatrixClient.prototype.setDisplayName = function(name, callback) {
-    return this.setProfileInfo(
+MatrixClient.prototype.setDisplayName = async function(name, callback) {
+    const prom = await this.setProfileInfo(
         "displayname", { displayname: name }, callback,
     );
+    // XXX: synthesise a profile update for ourselves because Synapse is broken and won't
+    const user = this.getUser(this.getUserId());
+    if (user) {
+        user.displayName = name;
+        user.emit("User.displayName", user.events.presence, user);
+    }
+    return prom;
 };
 
 /**
  * @param {string} url
  * @param {module:client.callback} callback Optional.
- * @return {Promise} Resolves: TODO
+ * @return {Promise} Resolves: {} an empty object.
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
-MatrixClient.prototype.setAvatarUrl = function(url, callback) {
-    return this.setProfileInfo(
+MatrixClient.prototype.setAvatarUrl = async function(url, callback) {
+    const prom = await this.setProfileInfo(
         "avatar_url", { avatar_url: url }, callback,
     );
+    // XXX: synthesise a profile update for ourselves because Synapse is broken and won't
+    const user = this.getUser(this.getUserId());
+    if (user) {
+        user.avatarUrl = url;
+        user.emit("User.avatarUrl", user.events.presence, user);
+    }
+    return prom;
 };
 
 /**
