@@ -26,6 +26,7 @@ import {EventEmitter} from 'events';
 import * as utils from '../utils';
 import MatrixEvent from '../models/event';
 import {EventType} from '../@types/event';
+import { RoomMember } from '../models/room-member';
 
 // events: hangup, error(err), replaced(call), state(state, oldState)
 
@@ -93,13 +94,11 @@ export enum CallEvent {
     Replaced = 'replaced',
 
     // The value of isLocalOnHold() has changed
+    LocalHoldUnhold = 'local_hold_unhold',
+    // The value of isRemoteOnHold() has changed
+    RemoteHoldUnhold = 'remote_hold_unhold',
+    // backwards compat alias for LocalHoldUnhold: remove in a major version bump
     HoldUnhold = 'hold_unhold',
-}
-
-enum MediaQueueId {
-    RemoteVideo = 'remote_video',
-    RemoteAudio = 'remote_audio',
-    LocalVideo = 'local_video',
 }
 
 export enum CallErrorCode {
@@ -175,11 +174,8 @@ export enum CallErrorCode {
 
 /**
  * The version field that we set in m.call.* events
- * Once we are able to speak v1 VoIP sufficiently, this
- * bumped to 1. While we partially speak v1 VoIP, it remains
- * as 0.
  */
-const VOIP_PROTO_VERSION = 0;
+const VOIP_PROTO_VERSION = 1;
 
 /** The fallback ICE server to use for STUN or TURN protocols. */
 const FALLBACK_ICE_SERVER = 'stun:turn.matrix.org';
@@ -224,7 +220,6 @@ export class MatrixCall extends EventEmitter {
     private turnServers: Array<TurnServer>;
     private candidateSendQueue: Array<RTCIceCandidate>;
     private candidateSendTries: number;
-    private mediaPromises: { [queueId: string]: Promise<void>; };
     private sentEndOfCandidates: boolean;
     private peerConn: RTCPeerConnection;
     private localVideoElement: HTMLVideoElement;
@@ -240,6 +235,7 @@ export class MatrixCall extends EventEmitter {
     // XXX: I don't know why this is called 'config'.
     private config: MediaStreamConstraints;
     private successor: MatrixCall;
+    private opponentMember: RoomMember;
     private opponentVersion: number;
     // The party ID of the other side: undefined if we haven't chosen a partner
     // yet, null if we have but they didn't send a party ID.
@@ -249,6 +245,11 @@ export class MatrixCall extends EventEmitter {
     // The logic of when & if a call is on hold is nontrivial and explained in is*OnHold
     // This flag represents whether we want the other party to be on hold
     private remoteOnHold;
+
+    // and this one we set when we're transitioning out of the hold state because we
+    // can't tell the difference between that and the other party holding us
+    private unholdingRemote;
+
     private micMuted;
     private vidMuted;
 
@@ -283,17 +284,12 @@ export class MatrixCall extends EventEmitter {
         this.candidateSendQueue = [];
         this.candidateSendTries = 0;
 
-        // Lookup from opaque queue ID to a promise for media element operations that
-        // need to be serialised into a given queue.  Store this per-MatrixCall on the
-        // assumption that multiple matrix calls will never compete for control of the
-        // same DOM elements.
-        this.mediaPromises = Object.create(null);
-
         this.sentEndOfCandidates = false;
         this.inviteOrAnswerSent = false;
         this.makingOffer = false;
 
         this.remoteOnHold = false;
+        this.unholdingRemote = false;
         this.micMuted = false;
         this.vidMuted = false;
     }
@@ -358,12 +354,8 @@ export class MatrixCall extends EventEmitter {
         this.type = CallType.Video;
     }
 
-    private queueMediaOperation(queueId: MediaQueueId, operation: () => any) {
-        if (this.mediaPromises[queueId] !== undefined) {
-            this.mediaPromises[queueId] = this.mediaPromises[queueId].then(operation, operation);
-        } else {
-            this.mediaPromises[queueId] = Promise.resolve(operation());
-        }
+    getOpponentMember() {
+        return this.opponentMember;
     }
 
     /**
@@ -397,17 +389,19 @@ export class MatrixCall extends EventEmitter {
      * video will be rendered to it immediately.
      * @param {Element} element The <code>&lt;video&gt;</code> DOM element.
      */
-    setLocalVideoElement(element : HTMLVideoElement) {
+    async setLocalVideoElement(element : HTMLVideoElement) {
         this.localVideoElement = element;
 
         if (element && this.localAVStream && this.type === CallType.Video) {
             element.autoplay = true;
 
-            this.queueMediaOperation(MediaQueueId.LocalVideo, () => {
-                element.srcObject = this.localAVStream;
-                element.muted = true;
-                return element.play();
-            });
+            element.srcObject = this.localAVStream;
+            element.muted = true;
+            try {
+                await element.play();
+            } catch (e) {
+                logger.info("Failed to play local video element", e);
+            }
         }
     }
 
@@ -428,10 +422,7 @@ export class MatrixCall extends EventEmitter {
         this.remoteVideoElement = element;
 
         if (this.remoteStream) {
-            this.queueMediaOperation(MediaQueueId.RemoteVideo, () => {
-                element.srcObject = this.remoteStream;
-                return element.play();
-            });
+            this.playRemoteVideo();
         }
     }
 
@@ -444,9 +435,7 @@ export class MatrixCall extends EventEmitter {
     async setRemoteAudioElement(element: HTMLAudioElement) {
         if (element === this.remoteAudioElement) return;
 
-        if (this.remoteVideoElement) this.remoteVideoElement.muted = true;
         this.remoteAudioElement = element;
-        this.remoteAudioElement.muted = false;
 
         if (this.remoteStream) this.playRemoteAudio();
     }
@@ -481,6 +470,7 @@ export class MatrixCall extends EventEmitter {
         this.direction = CallDirection.Inbound;
         this.opponentVersion = this.msg.version;
         this.opponentPartyId = this.msg.party_id || null;
+        this.opponentMember = event.sender;
 
         if (event.getLocalAge()) {
             setTimeout(() => {
@@ -663,6 +653,7 @@ export class MatrixCall extends EventEmitter {
     setRemoteOnHold(onHold: boolean) {
         if (this.isRemoteOnHold() === onHold) return;
         this.remoteOnHold = onHold;
+        if (!onHold) this.unholdingRemote = true;
 
         for (const tranceiver of this.peerConn.getTransceivers()) {
             // We set 'inactive' rather than 'sendonly' because we're not planning on
@@ -670,6 +661,12 @@ export class MatrixCall extends EventEmitter {
             tranceiver.direction = onHold ? 'inactive' : 'sendrecv';
         }
         this.updateMuteStatus();
+
+        if (!onHold) {
+            this.playRemoteAudio();
+        }
+
+        this.emit(CallEvent.RemoteHoldUnhold, this.remoteOnHold);
     }
 
     /**
@@ -682,6 +679,7 @@ export class MatrixCall extends EventEmitter {
      */
     isLocalOnHold(): boolean {
         if (this.state !== CallState.Connected) return false;
+        if (this.unholdingRemote) return false;
 
         let callOnHold = true;
 
@@ -706,6 +704,16 @@ export class MatrixCall extends EventEmitter {
 
         const vidShouldBeMuted = this.vidMuted || this.remoteOnHold;
         setTracksEnabled(this.localAVStream.getVideoTracks(), !vidShouldBeMuted);
+
+        if (this.remoteOnHold) {
+            if (this.remoteAudioElement && this.remoteAudioElement.srcObject === this.remoteStream) {
+                this.remoteAudioElement.muted = true;
+            } else if (this.remoteVideoElement && this.remoteVideoElement.srcObject === this.remoteStream) {
+                this.remoteVideoElement.muted = true;
+            }
+        } else {
+            this.playRemoteAudio();
+        }
     }
 
     /**
@@ -728,19 +736,21 @@ export class MatrixCall extends EventEmitter {
         const videoEl = this.getLocalVideoElement();
 
         if (videoEl && this.type === CallType.Video) {
-            this.queueMediaOperation(MediaQueueId.LocalVideo, () => {
-                videoEl.autoplay = true;
-                if (this.screenSharingStream) {
-                    logger.debug(
-                        "Setting screen sharing stream to the local video element",
-                    );
-                    videoEl.srcObject = this.screenSharingStream;
-                } else {
-                    videoEl.srcObject = stream;
-                }
-                videoEl.muted = true;
-                return videoEl.play();
-            });
+            videoEl.autoplay = true;
+            if (this.screenSharingStream) {
+                logger.debug(
+                    "Setting screen sharing stream to the local video element",
+                );
+                videoEl.srcObject = this.screenSharingStream;
+            } else {
+                videoEl.srcObject = stream;
+            }
+            videoEl.muted = true;
+            try {
+                await videoEl.play();
+            } catch (e) {
+                logger.info("Failed to play local video element", e);
+            }
         }
 
         this.localAVStream = stream;
@@ -805,13 +815,15 @@ export class MatrixCall extends EventEmitter {
         const localVidEl = this.getLocalVideoElement();
 
         if (localVidEl && this.type === CallType.Video) {
-            this.queueMediaOperation(MediaQueueId.LocalVideo, () => {
-                localVidEl.autoplay = true;
-                localVidEl.srcObject = stream;
+            localVidEl.autoplay = true;
+            localVidEl.srcObject = stream;
 
-                localVidEl.muted = true;
-                return localVidEl.play();
-            });
+            localVidEl.muted = true;
+            try {
+                await localVidEl.play();
+            } catch (e) {
+                logger.info("Failed to play local video element", e);
+            }
         }
 
         this.localAVStream = stream;
@@ -948,6 +960,7 @@ export class MatrixCall extends EventEmitter {
 
         this.opponentVersion = event.getContent().version;
         this.opponentPartyId = event.getContent().party_id || null;
+        this.opponentMember = event.sender;
 
         this.setState(CallState.Connecting);
 
@@ -1009,7 +1022,7 @@ export class MatrixCall extends EventEmitter {
         // Here we follow the perfect negotiation logic from
         // https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Perfect_negotiation
         const offerCollision = (
-            (description.type == 'offer') &&
+            (description.type === 'offer') &&
             (this.makingOffer || this.peerConn.signalingState != 'stable')
         );
 
@@ -1019,7 +1032,13 @@ export class MatrixCall extends EventEmitter {
             return;
         }
 
-        const prevOnHold = this.isLocalOnHold();
+        const prevLocalOnHold = this.isLocalOnHold();
+
+        if (description.type === 'answer') {
+            // whenever we get an answer back, clear the flag we set whilst trying to un-hold
+            // the other party: the state of the channels now reflects reality
+            this.unholdingRemote = false;
+        }
 
         try {
             await this.peerConn.setRemoteDescription(description);
@@ -1036,9 +1055,11 @@ export class MatrixCall extends EventEmitter {
             logger.warn("Failed to complete negotiation", err);
         }
 
-        const nowOnHold = this.isLocalOnHold();
-        if (prevOnHold !== nowOnHold) {
-            this.emit(CallEvent.HoldUnhold, nowOnHold);
+        const newLocalOnHold = this.isLocalOnHold();
+        if (prevLocalOnHold !== newLocalOnHold) {
+            this.emit(CallEvent.LocalHoldUnhold, newLocalOnHold);
+            // also this one for backwards compat
+            this.emit(CallEvent.HoldUnhold, newLocalOnHold);
         }
     }
 
@@ -1201,14 +1222,7 @@ export class MatrixCall extends EventEmitter {
 
         if (ev.track.kind === 'video') {
             if (this.remoteVideoElement) {
-                this.queueMediaOperation(MediaQueueId.RemoteVideo, async () => {
-                    this.remoteVideoElement.srcObject = this.remoteStream;
-                    try {
-                        await this.remoteVideoElement.play();
-                    } catch (e) {
-                        logger.error("Failed to play remote video element", e);
-                    }
-                });
+                this.playRemoteVideo();
             }
         } else {
             if (this.remoteAudioElement) this.playRemoteAudio();
@@ -1235,30 +1249,50 @@ export class MatrixCall extends EventEmitter {
         }
     };
 
-    playRemoteAudio() {
-        this.queueMediaOperation(MediaQueueId.RemoteAudio, async () => {
-            this.remoteAudioElement.srcObject = this.remoteStream;
+    async playRemoteAudio() {
+        if (this.remoteVideoElement) this.remoteVideoElement.muted = true;
+        this.remoteAudioElement.muted = false;
 
-            // if audioOutput is non-default:
-            try {
-                if (audioOutput) {
-                    // This seems quite unreliable in Chrome, although I haven't yet managed to make a jsfiddle where
-                    // it fails.
-                    // It seems reliable if you set the sink ID after setting the srcObject and then set the sink ID
-                    // back to the default after the call is over
-                    logger.info("Setting audio sink to " + audioOutput + ", was " + this.remoteAudioElement.sinkId);
-                    await this.remoteAudioElement.setSinkId(audioOutput);
-                }
-            } catch (e) {
-                logger.warn("Couldn't set requested audio output device: using default", e);
-            }
+        this.remoteAudioElement.srcObject = this.remoteStream;
 
-            try {
-                await this.remoteAudioElement.play();
-            } catch (e) {
-                logger.error("Failed to play remote video element", e);
+        // if audioOutput is non-default:
+        try {
+            if (audioOutput) {
+                // This seems quite unreliable in Chrome, although I haven't yet managed to make a jsfiddle where
+                // it fails.
+                // It seems reliable if you set the sink ID after setting the srcObject and then set the sink ID
+                // back to the default after the call is over
+                logger.info("Setting audio sink to " + audioOutput + ", was " + this.remoteAudioElement.sinkId);
+                await this.remoteAudioElement.setSinkId(audioOutput);
             }
-        });
+        } catch (e) {
+            logger.warn("Couldn't set requested audio output device: using default", e);
+        }
+
+        try {
+            await this.remoteAudioElement.play();
+        } catch (e) {
+            logger.error("Failed to play remote audio element", e);
+        }
+    }
+
+    private async playRemoteVideo() {
+        // A note on calling methods on media elements:
+        // We used to have queues per media element to serialise all calls on those elements.
+        // The reason given for this was that load() and play() were racing. However, we now
+        // never call load() explicitly so this seems unnecessary. However, serialising every
+        // operation was causing bugs where video would not resume because some play command
+        // had got stuck and all media operations were queued up behind it. If necessary, we
+        // should serialise the ones that need to be serialised but then be able to interrupt
+        // them with another load() which will cancel the pending one, but since we don't call
+        // load() explicitly, it shouldn't be a problem.
+        this.remoteVideoElement.srcObject = this.remoteStream;
+        logger.info("playing remote video. stream active? " + this.remoteStream.active);
+        try {
+            await this.remoteVideoElement.play();
+        } catch (e) {
+            logger.info("Failed to play remote video element", e);
+        }
     }
 
     onHangupReceived = (msg) => {
@@ -1266,13 +1300,12 @@ export class MatrixCall extends EventEmitter {
 
         // party ID must match (our chosen partner hanging up the call) or be undefined (we haven't chosen
         // a partner yet but we're treating the hangup as a reject as per VoIP v0)
-        if (!this.partyIdMatches(msg) && this.opponentPartyId !== undefined) {
+        if (this.partyIdMatches(msg) || this.opponentPartyId === undefined || this.state === CallState.Ringing) {
+            // default reason is user_hangup
+            this.terminate(CallParty.Remote, msg.reason || CallErrorCode.UserHangup, true);
+        } else {
             logger.info(`Ignoring message from party ID ${msg.party_id}: our partner is ${this.opponentPartyId}`);
-            return;
         }
-
-        // default reason is user_hangup
-        this.terminate(CallParty.Remote, msg.reason || CallErrorCode.UserHangup, true);
     };
 
     onRejectReceived = (msg) => {
@@ -1337,7 +1370,7 @@ export class MatrixCall extends EventEmitter {
         }
     }
 
-    private terminate(hangupParty: CallParty, hangupReason: CallErrorCode, shouldEmit: boolean) {
+    private async terminate(hangupParty: CallParty, hangupReason: CallErrorCode, shouldEmit: boolean) {
         if (this.callHasEnded()) return;
 
         if (this.inviteTimeout) {
@@ -1350,29 +1383,23 @@ export class MatrixCall extends EventEmitter {
         const localVid = this.getLocalVideoElement();
 
         if (remoteVid) {
-            this.queueMediaOperation(MediaQueueId.RemoteVideo, () => {
-                remoteVid.pause();
-                remoteVid.srcObject = null;
-            });
+            remoteVid.pause();
+            remoteVid.srcObject = null;
         }
         if (remoteAud) {
-            this.queueMediaOperation(MediaQueueId.RemoteAudio, async () => {
-                remoteAud.pause();
-                remoteAud.srcObject = null;
-                try {
-                    // As per comment in playRemoteAudio, setting the sink ID back to the default
-                    // once the call is over makes setSinkId work reliably.
-                    await this.remoteAudioElement.setSinkId('')
-                } catch (e) {
-                    logger.warn("Failed to set sink ID back to default");
-                }
-            });
+            remoteAud.pause();
+            remoteAud.srcObject = null;
+            try {
+                // As per comment in playRemoteAudio, setting the sink ID back to the default
+                // once the call is over makes setSinkId work reliably.
+                await this.remoteAudioElement.setSinkId('')
+            } catch (e) {
+                logger.warn("Failed to set sink ID back to default");
+            }
         }
         if (localVid) {
-            this.queueMediaOperation(MediaQueueId.LocalVideo, () => {
-                localVid.pause();
-                localVid.srcObject = null;
-            });
+            localVid.pause();
+            localVid.srcObject = null;
         }
         this.hangupParty = hangupParty;
         this.hangupReason = hangupReason;
@@ -1600,5 +1627,9 @@ export function createNewMatrixCall(client: any, roomId: string, options?: CallO
         // call level options
         forceTURN: client._forceTURN || optionsForceTURN,
     };
-    return new MatrixCall(opts);
+    const call = new MatrixCall(opts);
+
+    client.reEmitter.reEmit(call, Object.values(CallEvent));
+
+    return call;
 }
