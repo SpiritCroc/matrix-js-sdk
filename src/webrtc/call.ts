@@ -260,6 +260,11 @@ export class MatrixCall extends EventEmitter {
     private micMuted;
     private vidMuted;
 
+    // the stats for the call at the point it ended. We can't get these after we
+    // tear the call down, so we just grab a snapshot before we stop the call.
+    // The typescript definitions have this type as 'any' :(
+    private callStatsAtEnd: any[];
+
     // Perfect negotiation state: https://www.w3.org/TR/webrtc/#perfect-negotiation-example
     private makingOffer: boolean;
     private ignoreOffer: boolean;
@@ -364,11 +369,11 @@ export class MatrixCall extends EventEmitter {
         this.type = CallType.Video;
     }
 
-    getOpponentMember() {
+    public getOpponentMember() {
         return this.opponentMember;
     }
 
-    opponentCanBeTransferred() {
+    public opponentCanBeTransferred() {
         return Boolean(this.opponentCaps && this.opponentCaps["m.call.transferee"]);
     }
 
@@ -376,7 +381,7 @@ export class MatrixCall extends EventEmitter {
      * Retrieve the local <code>&lt;video&gt;</code> DOM element.
      * @return {Element} The dom element
      */
-    getLocalVideoElement(): HTMLVideoElement {
+    public getLocalVideoElement(): HTMLVideoElement {
         return this.localVideoElement;
     }
 
@@ -385,7 +390,7 @@ export class MatrixCall extends EventEmitter {
      * used for playing back video capable streams.
      * @return {Element} The dom element
      */
-    getRemoteVideoElement(): HTMLVideoElement {
+    public getRemoteVideoElement(): HTMLVideoElement {
         return this.remoteVideoElement;
     }
 
@@ -394,7 +399,7 @@ export class MatrixCall extends EventEmitter {
      * used for playing back audio only streams.
      * @return {Element} The dom element
      */
-    getRemoteAudioElement(): HTMLAudioElement {
+    public getRemoteAudioElement(): HTMLAudioElement {
         return this.remoteAudioElement;
     }
 
@@ -403,7 +408,7 @@ export class MatrixCall extends EventEmitter {
      * video will be rendered to it immediately.
      * @param {Element} element The <code>&lt;video&gt;</code> DOM element.
      */
-    async setLocalVideoElement(element : HTMLVideoElement) {
+    public async setLocalVideoElement(element : HTMLVideoElement) {
         this.localVideoElement = element;
 
         if (element && this.localAVStream && this.type === CallType.Video) {
@@ -424,7 +429,7 @@ export class MatrixCall extends EventEmitter {
      * the first received video-capable stream will be rendered to it immediately.
      * @param {Element} element The <code>&lt;video&gt;</code> DOM element.
      */
-    setRemoteVideoElement(element : HTMLVideoElement) {
+    public setRemoteVideoElement(element : HTMLVideoElement) {
         if (element === this.remoteVideoElement) return;
 
         element.autoplay = true;
@@ -446,12 +451,31 @@ export class MatrixCall extends EventEmitter {
      * The audio will *not* be rendered from the remoteVideoElement.
      * @param {Element} element The <code>&lt;video&gt;</code> DOM element.
      */
-    async setRemoteAudioElement(element: HTMLAudioElement) {
+    public async setRemoteAudioElement(element: HTMLAudioElement) {
         if (element === this.remoteAudioElement) return;
 
         this.remoteAudioElement = element;
 
         if (this.remoteStream) this.playRemoteAudio();
+    }
+
+    // The typescript definitions have this type as 'any' :(
+    public async getCurrentCallStats(): Promise<any[]> {
+        if (this.callHasEnded()) {
+            return this.callStatsAtEnd;
+        }
+
+        return this.collectCallStats();
+    }
+
+    private async collectCallStats(): Promise<any[]> {
+        const statsReport = await this.peerConn.getStats();
+        const stats = [];
+        for (const item of statsReport) {
+            stats.push(item[1]);
+        }
+
+        return stats;
     }
 
     /**
@@ -710,6 +734,21 @@ export class MatrixCall extends EventEmitter {
         }
 
         return callOnHold;
+    }
+
+    /**
+     * Sends a DTMF digit to the other party
+     * @param digit The digit (nb. string - '#' and '*' are dtmf too)
+     */
+    sendDtmfDigit(digit: string) {
+        for (const sender of this.peerConn.getSenders()) {
+            if (sender.track.kind === 'audio' && sender.dtmf) {
+                sender.dtmf.insertDTMF(digit);
+                return;
+            }
+        }
+
+        throw new Error("Unable to find a track to send DTMF on");
     }
 
     private updateMuteStatus() {
@@ -1072,8 +1111,21 @@ export class MatrixCall extends EventEmitter {
             await this.peerConn.setRemoteDescription(description);
 
             if (description.type === 'offer') {
+                // First we sent the direction of the tranciever to what we'd like it to be,
+                // irresepective of whether the other side has us on hold - so just whether we
+                // want the call to be on hold or not. This is necessary because in a few lines,
+                // we'll adjust the direction and unless we do this too, we'll never come off hold.
+                for (const tranceiver of this.peerConn.getTransceivers()) {
+                    tranceiver.direction = this.isRemoteOnHold() ? 'inactive' : 'sendrecv';
+                }
                 const localDescription = await this.peerConn.createAnswer();
                 await this.peerConn.setLocalDescription(localDescription);
+                // Now we've got our answer, set the direction to the outcome of the negotiation.
+                // We need to do this otherwise Firefox will notice that the direction is not the
+                // currentDirection and try to negotiate itself off hold again.
+                for (const tranceiver of this.peerConn.getTransceivers()) {
+                    tranceiver.direction = tranceiver.currentDirection;
+                }
 
                 this.sendVoipEvent(EventType.CallNegotiate, {
                     description: this.peerConn.localDescription,
@@ -1217,7 +1269,7 @@ export class MatrixCall extends EventEmitter {
             return; // because ICE can still complete as we're ending the call
         }
         logger.debug(
-            "ICE connection state changed to: " + this.peerConn.iceConnectionState,
+            "Call ID " + this.callId + ": ICE connection state changed to: " + this.peerConn.iceConnectionState,
         );
         // ideally we'd consider the call to be connected when we get media but
         // chrome doesn't implement any of the 'onstarted' events yet
@@ -1335,7 +1387,7 @@ export class MatrixCall extends EventEmitter {
     }
 
     onHangupReceived = (msg) => {
-        logger.debug("Hangup received");
+        logger.debug("Hangup received for call ID " + + this.callId);
 
         // party ID must match (our chosen partner hanging up the call) or be undefined (we haven't chosen
         // a partner yet but we're treating the hangup as a reject as per VoIP v0)
@@ -1348,7 +1400,7 @@ export class MatrixCall extends EventEmitter {
     };
 
     onRejectReceived = (msg) => {
-        logger.debug("Reject received");
+        logger.debug("Reject received for call ID " + this.callId);
 
         // No need to check party_id for reject because if we'd received either
         // an answer or reject, we wouldn't be in state InviteSent
@@ -1370,7 +1422,7 @@ export class MatrixCall extends EventEmitter {
     };
 
     onAnsweredElsewhere = (msg) => {
-        logger.debug("Answered elsewhere");
+        logger.debug("Call ID " + this.callId + " answered elsewhere");
         this.terminate(CallParty.Remote, CallErrorCode.AnsweredElsewhere, true);
     };
 
@@ -1442,6 +1494,8 @@ export class MatrixCall extends EventEmitter {
 
     private async terminate(hangupParty: CallParty, hangupReason: CallErrorCode, shouldEmit: boolean) {
         if (this.callHasEnded()) return;
+
+        this.callStatsAtEnd = await this.collectCallStats();
 
         if (this.inviteTimeout) {
             clearTimeout(this.inviteTimeout);
