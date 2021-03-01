@@ -377,6 +377,8 @@ export class MatrixCall extends EventEmitter {
             logger.debug("Electron getDesktopCapturerSources() is available...");
             try {
                 const selectedSource = await selectDesktopCapturerSource();
+                // If no source was selected cancel call
+                if (!selectedSource) return;
                 const getUserMediaOptions: MediaStreamConstraints | DesktopCapturerConstraints = {
                     audio: false,
                     video: {
@@ -877,7 +879,7 @@ export class MatrixCall extends EventEmitter {
             this.peerConn.addTrack(audioTrack, stream);
         }
         for (const videoTrack of (this.screenSharingStream || stream).getVideoTracks()) {
-            logger.info("Adding audio track with id " + videoTrack.id);
+            logger.info("Adding video track with id " + videoTrack.id);
             this.peerConn.addTrack(videoTrack, stream);
         }
 
@@ -1684,6 +1686,7 @@ export class MatrixCall extends EventEmitter {
         const pc = new window.RTCPeerConnection({
             iceTransportPolicy: this.forceTURN ? 'relay' : undefined,
             iceServers: this.turnServers,
+            iceCandidatePoolSize: this.client._iceCandidatePoolSize,
         });
 
         // 'connectionstatechange' would be better, but firefox doesn't implement that.
