@@ -79,6 +79,7 @@ class MockRTCPeerConnection {
         return Promise.resolve();
     }
     close() {}
+    getStats() { return []; }
 }
 
 describe('Call', function() {
@@ -122,6 +123,7 @@ describe('Call', function() {
         // We just stub out sendEvent: we're not interested in testing the client's
         // event sending code here
         client.client.sendEvent = () => {};
+        client.httpBackend.when("GET", "/voip/turnServer").respond(200, {});
         call = new MatrixCall({
             client: client.client,
             roomId: '!foo:bar',
@@ -138,7 +140,9 @@ describe('Call', function() {
     });
 
     it('should ignore candidate events from non-matching party ID', async function() {
-        await call.placeVoiceCall();
+        const callPromise = call.placeVoiceCall();
+        await client.httpBackend.flush();
+        await callPromise;
         await call.onAnswerReceived({
             getContent: () => {
                 return {
@@ -189,5 +193,65 @@ describe('Call', function() {
 
         // Hangup to stop timers
         call.hangup(CallErrorCode.UserHangup, true);
+    });
+
+    it('should add candidates received before answer if party ID is correct', async function() {
+        const callPromise = call.placeVoiceCall();
+        await client.httpBackend.flush();
+        await callPromise;
+        call.peerConn.addIceCandidate = jest.fn();
+
+        call.onRemoteIceCandidatesReceived({
+            getContent: () => {
+                return {
+                    version: 1,
+                    call_id: call.callId,
+                    party_id: 'the_correct_party_id',
+                    candidates: [
+                        {
+                            candidate: 'the_correct_candidate',
+                            sdpMid: '',
+                        },
+                    ],
+                };
+            },
+        });
+
+        call.onRemoteIceCandidatesReceived({
+            getContent: () => {
+                return {
+                    version: 1,
+                    call_id: call.callId,
+                    party_id: 'some_other_party_id',
+                    candidates: [
+                        {
+                            candidate: 'the_wrong_candidate',
+                            sdpMid: '',
+                        },
+                    ],
+                };
+            },
+        });
+
+        expect(call.peerConn.addIceCandidate.mock.calls.length).toBe(0);
+
+        await call.onAnswerReceived({
+            getContent: () => {
+                return {
+                    version: 1,
+                    call_id: call.callId,
+                    party_id: 'the_correct_party_id',
+                    answer: {
+                        sdp: DUMMY_SDP,
+                    },
+                };
+            },
+        });
+
+        expect(call.peerConn.addIceCandidate.mock.calls.length).toBe(1);
+        expect(call.peerConn.addIceCandidate).toHaveBeenCalledWith({
+            candidate: 'the_correct_candidate',
+            sdpMid: '',
+        });
     });
 });

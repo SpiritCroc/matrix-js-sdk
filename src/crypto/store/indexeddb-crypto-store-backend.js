@@ -20,6 +20,7 @@ import {logger} from '../../logger';
 import * as utils from "../../utils";
 
 export const VERSION = 9;
+const PROFILE_TRANSACTIONS = false;
 
 /**
  * Implementation of a CryptoStore which is backed by an existing
@@ -34,6 +35,7 @@ export class Backend {
      */
     constructor(db) {
         this._db = db;
+        this._nextTxnId = 0;
 
         // make sure we close the db on `onversionchange` - otherwise
         // attempts to delete the database will block (and subsequent
@@ -757,10 +759,27 @@ export class Backend {
         }));
     }
 
-    doTxn(mode, stores, func) {
+    doTxn(mode, stores, func, log = logger) {
+        let startTime;
+        let description;
+        if (PROFILE_TRANSACTIONS) {
+            const txnId = this._nextTxnId++;
+            startTime = Date.now();
+            description = `${mode} crypto store transaction ${txnId} in ${stores}`;
+            log.debug(`Starting ${description}`);
+        }
         const txn = this._db.transaction(stores, mode);
         const promise = promiseifyTxn(txn);
         const result = func(txn);
+        if (PROFILE_TRANSACTIONS) {
+            promise.then(() => {
+                const elapsedTime = Date.now() - startTime;
+                log.debug(`Finished ${description}, took ${elapsedTime} ms`);
+            }, () => {
+                const elapsedTime = Date.now() - startTime;
+                log.error(`Failed ${description}, took ${elapsedTime} ms`);
+            });
+        }
         return promise.then(() => {
             return result;
         });
