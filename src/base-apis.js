@@ -246,10 +246,25 @@ MatrixBaseApis.prototype.register = function(
 
 /**
  * Register a guest account.
+ * This method returns the auth info needed to create a new authenticated client,
+ * Remember to call `setGuest(true)` on the (guest-)authenticated client, e.g:
+ * ```javascript
+ * const tmpClient = await sdk.createClient(MATRIX_INSTANCE);
+ * const { user_id, device_id, access_token } = tmpClient.registerGuest();
+ * const client = createClient({
+ *   baseUrl: MATRIX_INSTANCE,
+ *   accessToken: access_token,
+ *   userId: user_id,
+ *   deviceId: device_id,
+ * })
+ * client.setGuest(true);
+ * ```
+ *
  * @param {Object=} opts Registration options
  * @param {Object} opts.body JSON HTTP body to provide.
  * @param {module:client.callback} callback Optional.
- * @return {Promise} Resolves: TODO
+ * @return {Promise} Resolves: JSON object that contains:
+ *                   { user_id, device_id, access_token, home_server }
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixBaseApis.prototype.registerGuest = function(opts, callback) {
@@ -1515,6 +1530,21 @@ MatrixBaseApis.prototype.setPassword = function(authDict, newPassword, callback)
 MatrixBaseApis.prototype.getDevices = function() {
     return this._http.authedRequest(
         undefined, 'GET', "/devices", undefined, undefined,
+    );
+};
+
+/**
+ * Gets specific device details for the logged-in user
+ * @param {string} device_id  device to query
+ * @return {Promise} Resolves: result object
+ * @return {module:http-api.MatrixError} Rejects: with an error response.
+ */
+MatrixBaseApis.prototype.getDevice = function(device_id) {
+    const path = utils.encodeUri("/devices/$device_id", {
+        $device_id: device_id,
+    });
+    return this._http.authedRequest(
+        undefined, 'GET', path, undefined, undefined,
     );
 };
 
