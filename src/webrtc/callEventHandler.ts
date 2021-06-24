@@ -87,7 +87,7 @@ export class CallEventHandler {
             }
             this.callEventBuffer = [];
         }
-    }
+    };
 
     private onEvent = (event: MatrixEvent) => {
         this.client.decryptEventIfNeeded(event);
@@ -117,7 +117,7 @@ export class CallEventHandler {
                 }
             });
         }
-    }
+    };
 
     private eventIsACall(event: MatrixEvent): boolean {
         const type = event.getType();
@@ -155,7 +155,7 @@ export class CallEventHandler {
             const timeUntilTurnCresExpire = this.client.getTurnServersExpiry() - Date.now();
             logger.info("Current turn creds expire in " + timeUntilTurnCresExpire + " ms");
             call = createNewMatrixCall(this.client, event.getRoomId(), {
-                forceTURN: this.client._forceTURN,
+                forceTURN: this.client.forceTURN,
             });
             if (!call) {
                 logger.log(
