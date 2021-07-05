@@ -14,28 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-export interface IImageInfo {
-    size?: number;
-    mimetype?: string;
-    thumbnail_info?: { // eslint-disable-line camelcase
-        w?: number;
-        h?: number;
-        size?: number;
-        mimetype?: string;
-    };
-    w?: number;
-    h?: number;
+declare module "another-json" {
+    export function stringify(o: object): string;
 }
-
-export enum Visibility {
-    Public = "public",
-    Private = "private",
-}
-
-export enum Preset {
-    PrivateChat = "private_chat",
-    TrustedPrivateChat = "trusted_private_chat",
-    PublicChat = "public_chat",
-}
-
-export type ResizeMethod = "crop" | "scale";
